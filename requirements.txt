@@ -1,0 +1,4 @@
+aiogram>=3.13.0,<4.0.0
+qrcode[pil]>=7.4.2
+psutil>=5.9.0
+python-dotenv>=1.0.0

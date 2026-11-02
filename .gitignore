@@ -1,0 +1,19 @@
+# Environment secrets (CRITICAL: never commit your bot token)
+.env
+.env.backup
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
