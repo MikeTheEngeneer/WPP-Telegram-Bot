@@ -1,9 +1,10 @@
 """Handlers for standalone clients management."""
 import datetime
+import html
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import ADMIN_IDS
@@ -25,12 +26,14 @@ def is_admin(user_id: int) -> bool:
 @router.callback_query(F.data.startswith("clients:page:"))
 async def cb_clients_page(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
         return
+
     page = int(callback.data.split(":")[-1])
     clients = WPPService.get_clients()
     kb = clients_list_kb(clients, page=page)
     text = (
-        "👥 <b>Прямые клиенты и подключения</b>\n"
+        "👥 <b>Клиенты и подключения</b>\n"
         "──────────────────────────────\n"
         f"Всего подключений: <b>{len(clients)}</b>\n"
         "Нажмите на клиента для просмотра настроек и получения ссылки:\n"
@@ -45,7 +48,9 @@ async def cb_clients_page(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("client:view:"))
 async def cb_client_view(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
         return
+
     cid = callback.data.split(":")[-1]
     client = WPPService.get_client_by_id(cid)
     if not client:
@@ -63,9 +68,10 @@ async def cb_client_view(callback: CallbackQuery):
     down = format_bytes(client.get("traffic_down", 0))
     total = client.get("traffic_human", "0 Б")
     proto = str(client.get("protocol", "vless")).upper()
+    name = html.escape(str(client.get("name", "Без имени")))
 
     text = (
-        f"👤 <b>Клиент:</b> <code>{client.get('name', 'Без имени')}</code>\n"
+        f"👤 <b>Клиент:</b> <code>{name}</code>\n"
         "──────────────────────────────\n"
         f"🔑 <b>Протокол:</b> <code>{proto}</code>\n"
         f"⚡️ <b>Статус:</b> {status_str}\n"
@@ -85,7 +91,9 @@ async def cb_client_view(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("client:toggle:"))
 async def cb_client_toggle(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
         return
+
     _, _, cid, action = callback.data.split(":")
     enable = (action == "enable")
     try:
@@ -95,78 +103,70 @@ async def cb_client_toggle(callback: CallbackQuery):
         await callback.answer(f"Ошибка: {exc}", show_alert=True)
         return
 
-    # Re-render client view
-    client = WPPService.get_client_by_id(cid)
-    if client:
-        is_enabled = bool(client.get("enabled", True))
-        status_str = "🟢 Активен (Включен)" if is_enabled else "🔴 Отключен"
-        up = format_bytes(client.get("traffic_up", 0))
-        down = format_bytes(client.get("traffic_down", 0))
-        total = client.get("traffic_human", "0 Б")
-        proto = str(client.get("protocol", "vless")).upper()
-        text = (
-            f"👤 <b>Клиент:</b> <code>{client.get('name', 'Без имени')}</code>\n"
-            "──────────────────────────────\n"
-            f"🔑 <b>Протокол:</b> <code>{proto}</code>\n"
-            f"⚡️ <b>Статус:</b> {status_str}\n"
-            f"📊 <b>Трафик:</b> {total} (↑ {up} / ↓ {down})\n"
-            f"🆔 <b>ID:</b> <code>{client.get('id')}</code>\n"
-            "──────────────────────────────"
-        )
-        kb = client_detail_kb(cid, is_enabled)
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    callback.data = f"client:view:{cid}"
+    await cb_client_view(callback)
 
 
 @router.callback_query(F.data.startswith("client:link:"))
 async def cb_client_link(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
         return
+
+    await callback.answer("Получаем ссылку...")
     cid = callback.data.split(":")[-1]
     client = WPPService.get_client_by_id(cid)
     if not client:
-        await callback.answer("Клиент не найден", show_alert=True)
+        await callback.message.answer("Клиент не найден.")
         return
 
-    link = WPPService.generate_proxy_link(client)
-    proto = str(client.get("protocol", "vless")).lower()
+    try:
+        link = WPPService.generate_proxy_link(client)
+        proto = str(client.get("protocol", "vless")).lower()
+        name = html.escape(str(client.get("name", "Без имени")))
 
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="📱 Показать QR-код", callback_data=f"client:qr:{cid}"))
-    builder.row(InlineKeyboardButton(text="🔙 Назад к клиенту", callback_data=f"client:view:{cid}"))
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="📱 Показать QR-код", callback_data=f"client:qr:{cid}"))
+        builder.row(InlineKeyboardButton(text="🔙 Назад к клиенту", callback_data=f"client:view:{cid}"))
 
-    if proto in ("awg20", "awg31"):
-        # Send config file for AmneziaWG
-        doc = BufferedInputFile(link.encode("utf-8"), filename=f"wpp-{client.get('name')}.conf")
-        await callback.message.answer_document(
-            document=doc,
-            caption=f"🛡 Конфигурационный файл для <b>{client.get('name')}</b> (AmneziaWG)",
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML",
-        )
-    else:
-        text = (
-            f"🔗 <b>Ссылка подключения для {client.get('name')}:</b>\n\n"
-            f"<code>{link}</code>\n\n"
-            "<i>💡 Нажмите на ссылку, чтобы скопировать её в буфер обмена.</i>"
-        )
-        await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
-    await callback.answer()
+        if proto in ("awg20", "awg31"):
+            doc = BufferedInputFile(link.encode("utf-8"), filename=f"wpp-{client.get('name')}.conf")
+            await callback.message.answer_document(
+                document=doc,
+                caption=f"🛡 Конфигурационный файл для <b>{name}</b> (AmneziaWG)",
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML",
+            )
+        else:
+            escaped_link = html.escape(link)
+            text = (
+                f"🔗 <b>Ссылка подключения для {name}:</b>\n\n"
+                f"<code>{escaped_link}</code>\n\n"
+                "<i>💡 Нажмите на ссылку, чтобы скопировать её в буфер обмена.</i>"
+            )
+            await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    except Exception as exc:
+        await callback.message.answer(f"❌ Ошибка генерации ссылки: {html.escape(str(exc))}")
 
 
 @router.callback_query(F.data.startswith("client:qr:"))
 async def cb_client_qr(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
         return
+
+    await callback.answer("Генерируем QR-код...")
     cid = callback.data.split(":")[-1]
     client = WPPService.get_client_by_id(cid)
     if not client:
-        await callback.answer("Клиент не найден", show_alert=True)
+        await callback.message.answer("Клиент не найден.")
         return
 
-    link = WPPService.generate_proxy_link(client)
-    proto = str(client.get("protocol", "vless")).upper()
-
     try:
+        link = WPPService.generate_proxy_link(client)
+        proto = str(client.get("protocol", "vless")).upper()
+        name = html.escape(str(client.get("name", "Без имени")))
+
         qr_io = generate_qr_bytes(link)
         photo = BufferedInputFile(qr_io.getvalue(), filename="qr.png")
 
@@ -174,7 +174,7 @@ async def cb_client_qr(callback: CallbackQuery):
         builder.row(InlineKeyboardButton(text="🔙 Назад к клиенту", callback_data=f"client:view:{cid}"))
 
         caption = (
-            f"📱 <b>QR-код для подключения: {client.get('name')}</b>\n"
+            f"📱 <b>QR-код для подключения: {name}</b>\n"
             f"Протокол: <code>{proto}</code>\n\n"
             "<i>Отсканируйте камерой телефона или клиентом v2rayNG / Streisand / Happ.</i>"
         )
@@ -185,22 +185,24 @@ async def cb_client_qr(callback: CallbackQuery):
             parse_mode="HTML",
         )
     except Exception as exc:
-        await callback.answer(f"Не удалось сгенерировать QR: {exc}", show_alert=True)
-    await callback.answer()
+        await callback.message.answer(f"❌ Ошибка формирования QR-кода: {html.escape(str(exc))}")
 
 
 @router.callback_query(F.data.startswith("client:del_confirm:"))
 async def cb_client_del_confirm(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
         return
+
     cid = callback.data.split(":")[-1]
     client = WPPService.get_client_by_id(cid)
     if not client:
         await callback.answer("Клиент не найден", show_alert=True)
         return
 
+    name = html.escape(str(client.get("name", "Без имени")))
     text = (
-        f"⚠️ <b>Вы действительно хотите удалить клиента «{client.get('name')}»?</b>\n\n"
+        f"⚠️ <b>Вы действительно хотите удалить клиента «{name}»?</b>\n\n"
         "Ключ доступа будет аннулирован, а соединение разорвано."
     )
     kb = confirm_delete_kb("client", cid)
@@ -212,6 +214,7 @@ async def cb_client_del_confirm(callback: CallbackQuery):
 async def cb_client_del_exec(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
+
     cid = callback.data.split(":")[-1]
     try:
         WPPService.delete_client(cid)
@@ -220,11 +223,10 @@ async def cb_client_del_exec(callback: CallbackQuery):
         await callback.answer(f"Ошибка удаления: {exc}", show_alert=True)
         return
 
-    # Return to clients list
     clients = WPPService.get_clients()
     kb = clients_list_kb(clients, page=0)
     text = (
-        "👥 <b>Прямые клиенты и подключения</b>\n"
+        "👥 <b>Клиенты и подключения</b>\n"
         "──────────────────────────────\n"
         f"Всего подключений: <b>{len(clients)}</b>\n"
     )
@@ -235,6 +237,7 @@ async def cb_client_del_exec(callback: CallbackQuery):
 async def cb_client_rename(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
+
     cid = callback.data.split(":")[-1]
     await state.update_data(client_id=cid)
     await state.set_state(RenameClientState.waiting_for_name)
@@ -254,6 +257,7 @@ async def cb_client_rename(callback: CallbackQuery, state: FSMContext):
 async def msg_client_rename(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+
     data = await state.get_data()
     cid = data.get("client_id")
     new_name = message.text.strip()
@@ -265,16 +269,16 @@ async def msg_client_rename(message: Message, state: FSMContext):
     await state.clear()
     try:
         WPPService.rename_client(cid, new_name)
-        await message.answer(f"✅ Клиент успешно переименован в <b>{new_name}</b>!", parse_mode="HTML")
+        await message.answer(f"✅ Клиент успешно переименован в <b>{html.escape(new_name)}</b>!", parse_mode="HTML")
     except Exception as exc:
-        await message.answer(f"❌ Не удалось переименовать: {exc}")
+        await message.answer(f"❌ Не удалось переименовать: {html.escape(str(exc))}")
 
     client = WPPService.get_client_by_id(cid)
     if client:
         is_enabled = bool(client.get("enabled", True))
         kb = client_detail_kb(cid, is_enabled)
         await message.answer(
-            f"👤 <b>Клиент:</b> <code>{client.get('name')}</code>\nID: <code>{cid}</code>",
+            f"👤 <b>Клиент:</b> <code>{html.escape(client.get('name'))}</code>\nID: <code>{cid}</code>",
             reply_markup=kb,
             parse_mode="HTML",
         )

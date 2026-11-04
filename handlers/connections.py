@@ -1,4 +1,5 @@
 """Handlers for server connections / routes live monitoring."""
+import html
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
@@ -26,7 +27,9 @@ async def cb_conns_list(callback: CallbackQuery):
         active_lines = []
         for c in active_now:
             speed = f" — ⚡️ <code>{c['speed_str']}</code>" if c.get("speed_str") and c["speed_str"] != "0 Б/с" else ""
-            active_lines.append(f"  👉 🔥 <b>{c['name']}</b> ({c['route_label']}){speed}")
+            c_name = html.escape(str(c.get("name", "")))
+            c_route = html.escape(str(c.get("route_label", "")))
+            active_lines.append(f"  👉 🔥 <b>{c_name}</b> ({c_route}){speed}")
         live_banner = "⚡️ <b>СЕЙЧАС ТРАФИК ИДЕТ ЧЕРЕЗ:</b>\n" + "\n".join(active_lines) + "\n"
     else:
         live_banner = "💤 <b>Текущая активность:</b> В данный момент активного потока нет (режим ожидания)\n"
@@ -74,19 +77,25 @@ async def cb_conn_view(callback: CallbackQuery):
 
     clients_list = conn.get("clients_list", [])
     if clients_list:
-        clients_str = ", ".join(f"<code>{name}</code>" for name in clients_list)
+        clients_str = ", ".join(f"<code>{html.escape(str(name))}</code>" for name in clients_list)
     else:
         clients_str = "<i>Пока не привязаны</i>"
 
+    conn_name = html.escape(str(conn.get('name', '')))
+    route_label = html.escape(str(conn.get('route_label', '')))
+    proto = html.escape(str(conn.get('protocol', '')).upper())
+    mode = html.escape(str(conn.get('mode', '')))
+    host = html.escape(str(conn.get('public_host', '')))
+
     text = (
-        f"🌐 <b>Подключение:</b> <code>{conn.get('name')}</code>\n"
+        f"🌐 <b>Подключение:</b> <code>{conn_name}</code>\n"
         "──────────────────────────────\n"
         f"⚡️ <b>Live-статус:</b> {live_status}\n"
         f"🔘 <b>Состояние:</b> {status_str}\n\n"
-        f"🛣 <b>Маршрут:</b> <code>{conn.get('route_label')}</code>\n"
-        f"🔑 <b>Протокол:</b> <code>{conn.get('protocol').upper()}</code> ({conn.get('mode')})\n"
+        f"🛣 <b>Маршрут:</b> <code>{route_label}</code>\n"
+        f"🔑 <b>Протокол:</b> <code>{proto}</code> ({mode})\n"
         f"🔌 <b>Порт:</b> <code>{conn.get('port')}</code>\n"
-        f"🌐 <b>Хост / SNI:</b> <code>{conn.get('public_host')}</code>\n\n"
+        f"🌐 <b>Хост / SNI:</b> <code>{host}</code>\n\n"
         f"📊 <b>Трафик по этому маршруту:</b> {total}\n"
         f"  • Исходящий (↑): <code>{up}</code>\n"
         f"  • Входящий (↓): <code>{down}</code>\n\n"

@@ -1,4 +1,5 @@
 """Start command and main dashboard handlers."""
+import html
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
@@ -36,7 +37,9 @@ def format_dashboard_text() -> str:
         routes_lines = []
         for c in active_now:
             speed_str = f" · ⚡️ <code>{c['speed_str']}</code>" if c.get("speed_str") and c['speed_str'] != "0 Б/с" else ""
-            routes_lines.append(f"  👉 🔥 <b>{c['name']}</b> ({c['route_label']}){speed_str}")
+            c_name = html.escape(str(c.get("name", "")))
+            c_route = html.escape(str(c.get("route_label", "")))
+            routes_lines.append(f"  👉 🔥 <b>{c_name}</b> ({c_route}){speed_str}")
         live_route_banner = "⚡️ <b>Трафик идет прямо сейчас через:</b>\n" + "\n".join(routes_lines) + "\n\n"
     else:
         live_route_banner = "⚡️ <b>Активный маршрут:</b> 💤 <i>Ожидание (нет активной передачи)</i>\n\n"

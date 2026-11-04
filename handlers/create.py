@@ -1,4 +1,5 @@
 """Creation wizard handlers for clients and subscriptions."""
+import html
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -114,7 +115,7 @@ async def msg_create_name(message: Message, state: FSMContext):
             InlineKeyboardButton(text="10 устр.", callback_data="sub_limit:10"),
         )
         await message.answer(
-            f"📱 Укажите <b>лимит одновременно подключенных устройств</b> для «{name}»:\n"
+            f"📱 Укажите <b>лимит одновременно подключенных устройств</b> для «{html.escape(name)}»:\n"
             "<i>(0 — без ограничений по HWID)</i>",
             reply_markup=builder.as_markup(),
             parse_mode="HTML",
@@ -144,9 +145,9 @@ async def msg_create_name(message: Message, state: FSMContext):
         photo = BufferedInputFile(qr_io.getvalue(), filename="qr.png")
 
         caption = (
-            f"🎉 <b>Подключение «{name}» успешно создано!</b>\n"
-            f"Протокол: <code>{proto_type.upper()}</code>\n\n"
-            f"🔗 <b>Ссылка:</b>\n<code>{link}</code>"
+            f"🎉 <b>Подключение «{html.escape(name)}» успешно создано!</b>\n"
+            f"Протокол: <code>{html.escape(proto_type.upper())}</code>\n\n"
+            f"🔗 <b>Ссылка:</b>\n<code>{html.escape(link)}</code>"
         )
         await message.answer_photo(
             photo=photo,
@@ -156,7 +157,7 @@ async def msg_create_name(message: Message, state: FSMContext):
         )
 
     except Exception as exc:
-        await msg_wait.edit_text(f"❌ Ошибка создания подключения: {exc}")
+        await msg_wait.edit_text(f"❌ Ошибка создания подключения: {html.escape(str(exc))}")
 
 
 @router.callback_query(F.data.startswith("sub_limit:"))
@@ -196,7 +197,6 @@ async def process_sub_creation(target_msg: Message, state: FSMContext, max_devic
         sid = created_sub.get("id", "") if created_sub else ""
         if sid:
             builder.row(InlineKeyboardButton(text="⚙️ Управление подпиской", callback_data=f"sub:view:{sid}"))
-        builder.row(InlineKeyboardButton(text="🚀 Открыть в Happ", url=f"happ://add/{sub_url}"))
         builder.row(InlineKeyboardButton(text="🔙 В главное меню", callback_data="menu:main"))
 
         # Send QR code
@@ -205,10 +205,11 @@ async def process_sub_creation(target_msg: Message, state: FSMContext, max_devic
 
         limit_info = f"{max_devices} устр." if max_devices else "без лимита"
         caption = (
-            f"🎉 <b>Мульти-подписка «{name}» создана!</b>\n"
+            f"🎉 <b>Мульти-подписка «{html.escape(name)}» создана!</b>\n"
             f"Лимит: <code>{limit_info}</code>\n\n"
             f"🔗 <b>Ссылка для приложений (Happ, Streisand, v2rayNG):</b>\n"
-            f"<code>{sub_url}</code>"
+            f"<code>{html.escape(sub_url)}</code>\n\n"
+            "<i>💡 Нажмите на ссылку, чтобы скопировать её.</i>"
         )
         await target_msg.answer_photo(
             photo=photo,
@@ -217,4 +218,4 @@ async def process_sub_creation(target_msg: Message, state: FSMContext, max_devic
             parse_mode="HTML",
         )
     except Exception as exc:
-        await wait_msg.edit_text(f"❌ Ошибка создания подписки: {exc}")
+        await wait_msg.edit_text(f"❌ Ошибка создания подписки: {html.escape(str(exc))}")

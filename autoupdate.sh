@@ -34,3 +34,4 @@ if [ -n "$LOCAL" ] && [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
     
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Бот успешно обновлен и перезапущен!" | tee -a "$LOG_FILE"
 fi
+
