@@ -37,6 +37,7 @@ METRICS_FILE = Path("/var/lib/tproxy-panel/metrics.json")
 DATA_FILE = Path("/var/lib/tproxy-panel/data.json")
 XRAY_PATH_FILE = Path("/etc/web-proxy-panel/xray-path")
 PRIMARY_SECRET_FILE = Path("/etc/web-proxy-panel/primary-secret")
+MTPROTO_HOST_FILE = Path("/etc/web-proxy-panel/mtproto-host")
 PANEL_SERVICE = Path("/etc/systemd/system/tproxy-panel.service")
 CADDY_CONF = Path("/etc/systemd/system/caddy.service.d/tproxy.conf")
 

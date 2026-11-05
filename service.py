@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import quote, urlencode
 
@@ -16,6 +17,7 @@ from config import (
     DOMAIN,
     MANAGER_BIN,
     METRICS_FILE,
+    MTPROTO_HOST_FILE,
     PRIMARY_SECRET_FILE,
     TRAFFIC_FILE,
     USERS_FILE,
@@ -82,12 +84,22 @@ def run_ctl(*args: str, input_json: dict = None) -> dict:
         return {"raw": out}
 
 
+def run_subscription(payload: dict) -> dict:
+    """`panelctl subscription` reports failures as {"ok": false} with exit code 0, so check it explicitly."""
+    res = run_ctl("subscription", input_json=payload)
+    if isinstance(res, dict) and res.get("ok") is False:
+        raise RuntimeError(res.get("message") or "Операция с подпиской не выполнена")
+    return res
+
+
 class LiveTrafficTracker:
     """Real-time 3-second traffic delta sampler directly from Xray, AWG and kernel."""
     def __init__(self):
         self.last_sample_time = 0.0
         self.last_user_bytes = {}  # {uid: {"up": int, "down": int}}
         self.connection_speeds = {}  # {cid: {"speed_total": float, "speed_human": str, "last_active_time": float}}
+        # sample() runs both from the background worker thread and from handler threads
+        self.lock = threading.Lock()
 
     def get_live_raw_user_counters(self, users: list[dict]) -> dict:
         result = {}
@@ -136,20 +148,15 @@ class LiveTrafficTracker:
                     pass
                 break
 
-        # 3. Fallback to traffic.json if direct query didn't return
-        if TRAFFIC_FILE.is_file():
-            try:
-                with open(TRAFFIC_FILE, encoding="utf-8") as f:
-                    saved = json.load(f)
-                    for uid, val in saved.items():
-                        if uid not in result and isinstance(val, dict):
-                            result[uid] = {"up": val.get("raw_up", 0), "down": val.get("raw_down", 0)}
-            except Exception:
-                pass
-
+        # No traffic.json fallback here: its persisted totals use a different base than the live
+        # Xray/AWG counters, so mixing them produced fake multi-GB/s spikes on the next sample.
         return result
 
     def sample(self, users: list[dict], connections: list[dict]):
+        with self.lock:
+            self._sample(users, connections)
+
+    def _sample(self, users: list[dict], connections: list[dict]):
         now = time.time()
         current_raw = self.get_live_raw_user_counters(users)
 
@@ -162,7 +169,10 @@ class LiveTrafficTracker:
         user_speeds = {}
 
         for uid, cur in current_raw.items():
-            prev = self.last_user_bytes.get(uid, {"up": 0, "down": 0})
+            prev = self.last_user_bytes.get(uid)
+            if prev is None:
+                # First time we see this user: no baseline yet, otherwise the whole counter counts as a delta
+                continue
             delta_up = max(0, cur.get("up", 0) - prev.get("up", 0))
             delta_down = max(0, cur.get("down", 0) - prev.get("down", 0))
             user_speeds[uid] = {
@@ -394,31 +404,55 @@ class WPPService:
 
     @classmethod
     def toggle_connection(cls, conn_id: str, enable: bool) -> bool:
+        """Toggle a transport the same way the web panel does, rolling back if the services fail to apply it."""
         if not CONNECTIONS_FILE.is_file():
             raise RuntimeError("Файл connections.json не найден")
 
-        with open(CONNECTIONS_FILE, encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            import wpp_connections as store
+        except ImportError:
+            store = None
 
-        found = False
-        for c in data.get("connections", []):
-            if str(c.get("id")) == str(conn_id):
-                c["enabled"] = bool(enable)
-                found = True
-                break
+        if store is not None:
+            previous = store.load(str(CONNECTIONS_FILE))
+            existing = store.get(previous, conn_id)
+            if not isinstance(existing, dict):
+                raise RuntimeError(f"Подключение {conn_id} не найдено")
+            updated = dict(existing)
+            updated["enabled"] = bool(enable)
+            store.upsert(str(CONNECTIONS_FILE), updated)
+            try:
+                run_ctl("connections-refresh")
+            except Exception:
+                store.save(str(CONNECTIONS_FILE), previous)
+                try:
+                    run_ctl("connections-refresh")
+                except Exception:
+                    pass
+                raise
+            return True
 
-        if not found:
+        # Fallback without panel modules: atomic write that keeps the original 0600 permissions
+        original = CONNECTIONS_FILE.read_text(encoding="utf-8")
+        data = json.loads(original)
+        conn = next((c for c in data.get("connections", []) if str(c.get("id")) == str(conn_id)), None)
+        if conn is None:
             raise RuntimeError(f"Подключение {conn_id} не найдено")
+        conn["enabled"] = bool(enable)
 
-        tmp = str(CONNECTIONS_FILE) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, str(CONNECTIONS_FILE))
+        def write(text: str):
+            tmp = CONNECTIONS_FILE.with_name(CONNECTIONS_FILE.name + ".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, CONNECTIONS_FILE)
 
+        write(json.dumps(data, ensure_ascii=False, indent=2))
         try:
             run_ctl("connections-refresh")
         except Exception:
-            pass
+            write(original)
+            raise
         return True
 
     @classmethod
@@ -500,6 +534,68 @@ class WPPService:
                 return s
         return None
 
+    @staticmethod
+    def get_mtproto_host() -> str:
+        try:
+            host = MTPROTO_HOST_FILE.read_text(encoding="utf-8").strip()
+            if host:
+                return host
+        except OSError:
+            pass
+        return DOMAIN
+
+    @staticmethod
+    def _load_connection(conn_id: str) -> dict | None:
+        if not conn_id or not CONNECTIONS_FILE.is_file():
+            return None
+        try:
+            with open(CONNECTIONS_FILE, encoding="utf-8") as f:
+                doc = json.load(f)
+            return next((c for c in doc.get("connections", []) if c.get("id") == conn_id), None)
+        except Exception:
+            return None
+
+    @classmethod
+    def _vless_link(cls, client: dict, secret: str, label: str) -> str:
+        """Mirror of the panel's proxy_link(): honours CDN routes and per-connection XHTTP settings."""
+        domain = cls.get_domain()
+        connection = cls._load_connection(str(client.get("connection_id", "")))
+        try:
+            import wpp_cdn as cdn
+            import wpp_connections as store
+        except ImportError:
+            cdn = store = None
+
+        if cdn is not None:
+            route = cdn.vless_route(domain, client.get("cdn"))
+            if connection:
+                route = store.apply_client_advanced(route, connection.get("advanced", {}))
+            xray_root = cls.get_xray_path()
+            route_path = cdn.client_endpoint_path(xray_root, route.get("path_variant", "cdn" if route["enabled"] else "direct"))
+            if connection:
+                xhttp = connection.get("advanced", {}).get("inbound", {}).get("streamSettings", {}).get("xhttpSettings", {})
+                route_path = store.client_path(connection, xray_root)
+                if xhttp.get("mode") and xhttp["mode"] != "auto":
+                    route["mode"] = xhttp["mode"]
+                    if route.get("extra") and "mode" in route["extra"]:
+                        route["extra"]["mode"] = xhttp["mode"]
+                route["extra"] = {**(route.get("extra") or {}), **{k: v for k, v in xhttp.items() if k not in ("path", "mode", "host")}}
+            query_values = {
+                "encryption": "none", "security": "tls", "sni": route["sni"], "fp": route["fingerprint"],
+                "type": "xhttp", "host": route["host"], "path": route_path, "mode": route["mode"],
+                "alpn": ",".join(route.get("alpn") or ["h2"]),
+            }
+            if route.get("extra"):
+                query_values["extra"] = json.dumps(route["extra"], ensure_ascii=True, separators=(",", ":"))
+            return f"vless://{quote(secret, safe='-')}@{route['address']}:443?{urlencode(query_values)}#{label}"
+
+        # Fallback without panel modules (direct route only)
+        query_values = {
+            "encryption": "none", "security": "tls", "sni": domain, "fp": "chrome", "type": "xhttp",
+            "host": domain, "path": cls.get_xray_path(), "mode": "auto", "alpn": "h2",
+        }
+        return f"vless://{quote(secret, safe='-')}@{domain}:443?{urlencode(query_values)}#{label}"
+
     @classmethod
     def generate_proxy_link(cls, client: dict) -> str:
         protocol = client.get("protocol", "vless")
@@ -512,30 +608,19 @@ class WPPService:
 
         if protocol == "mtproto":
             client_secret = secret if secret.startswith("dd") else "dd" + secret
-            return f"https://t.me/proxy?server={domain}&port={port}&secret={client_secret}"
+            return f"https://t.me/proxy?server={cls.get_mtproto_host()}&port={port}&secret={client_secret}"
 
         if protocol == "web":
             return f"https://t.me/webproxy?server={domain}&secret={secret}"
 
         if protocol == "vless":
-            xray_path = cls.get_xray_path()
-            query_values = {
-                "encryption": "none",
-                "security": "tls",
-                "sni": domain,
-                "fp": "chrome",
-                "type": "xhttp",
-                "host": domain,
-                "path": xray_path,
-                "mode": "auto",
-                "alpn": "h2",
-            }
-            query = urlencode(query_values)
-            return f"vless://{quote(secret, safe='-')}@{domain}:443?{query}#{label}"
+            return cls._vless_link(client, secret, label)
 
         if protocol == "hysteria":
             query = urlencode({"sni": domain, "alpn": "h3"})
-            h_port = port if port else 8443
+            connection = cls._load_connection(str(client.get("connection_id", "")))
+            conn_port = (connection or {}).get("advanced", {}).get("inbound", {}).get("port")
+            h_port = conn_port or port or 8443
             return f"hysteria2://{quote(secret, safe='-')}@{domain}:{h_port}/?{query}#{label}"
 
         if protocol in ("awg20", "awg31"):
@@ -549,8 +634,9 @@ class WPPService:
                     route_state = {"profiles": {}, "awg_profiles": {}}
                 routes = routing_store.awg_allowed_ips(route_state, client.get("connection_id", ""))
                 return wpp_awg.client_config(client, domain, name, routes)
-            except Exception:
-                return f"# AmneziaWG profile ID: {client.get('id')}\n# Secret: {secret}"
+            except Exception as exc:
+                # Never hand out a fake .conf that silently does not work
+                raise RuntimeError(f"Не удалось собрать конфиг AmneziaWG: {exc}") from exc
 
         return f"# Неизвестный протокол: {protocol}"
 
@@ -573,10 +659,7 @@ class WPPService:
             "max_devices": int(max_devices),
             "failover_enabled": True,
         }
-        res = run_ctl("subscription", input_json=payload)
-        if not res.get("ok", True):
-            raise RuntimeError(res.get("message", "Не удалось создать подписку"))
-        return res
+        return run_subscription(payload)
 
     @classmethod
     def toggle_client(cls, client_id: str, enable: bool) -> dict:
@@ -597,7 +680,7 @@ class WPPService:
             "id": sub_id,
             "enabled": enable,
         }
-        return run_ctl("subscription", input_json=payload)
+        return run_subscription(payload)
 
     @classmethod
     def rename_subscription(cls, sub_id: str, new_name: str) -> dict:
@@ -606,7 +689,7 @@ class WPPService:
             "id": sub_id,
             "name": new_name.strip(),
         }
-        return run_ctl("subscription", input_json=payload)
+        return run_subscription(payload)
 
     @classmethod
     def rotate_subscription(cls, sub_id: str) -> dict:
@@ -614,7 +697,7 @@ class WPPService:
             "operation": "rotate",
             "id": sub_id,
         }
-        return run_ctl("subscription", input_json=payload)
+        return run_subscription(payload)
 
     @classmethod
     def delete_subscription(cls, sub_id: str) -> dict:
@@ -622,7 +705,7 @@ class WPPService:
             "operation": "delete",
             "id": sub_id,
         }
-        return run_ctl("subscription", input_json=payload)
+        return run_subscription(payload)
 
     @classmethod
     def revoke_sub_device(cls, sub_id: str, device_id: str) -> dict:
@@ -631,7 +714,7 @@ class WPPService:
             "id": sub_id,
             "device_id": device_id,
         }
-        return run_ctl("subscription", input_json=payload)
+        return run_subscription(payload)
 
     @classmethod
     def get_system_metrics(cls) -> dict:

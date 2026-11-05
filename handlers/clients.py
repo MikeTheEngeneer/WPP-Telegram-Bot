@@ -1,16 +1,18 @@
 """Handlers for standalone clients management."""
 import datetime
 import html
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import ADMIN_IDS
-from keyboards import back_to_menu_kb, client_detail_kb, clients_list_kb, confirm_delete_kb
+from keyboards import client_detail_kb, clients_list_kb, confirm_delete_kb
 from qr import generate_qr_bytes
 from service import WPPService, format_bytes
+
+from .common import run, show
 
 router = Router()
 
@@ -19,43 +21,31 @@ class RenameClientState(StatesGroup):
     waiting_for_name = State()
 
 
-def is_admin(user_id: int) -> bool:
-    return not ADMIN_IDS or user_id in ADMIN_IDS
+def clients_list_text(count: int) -> str:
+    return (
+        "👥 <b>Клиенты и подключения</b>\n"
+        "──────────────────────────────\n"
+        f"Всего подключений: <b>{count}</b>\n"
+        "Нажмите на клиента для просмотра настроек и получения ссылки:\n"
+    )
 
 
 @router.callback_query(F.data.startswith("clients:page:"))
-async def cb_clients_page(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
-    page = int(callback.data.split(":")[-1])
-    clients = WPPService.get_clients()
-    kb = clients_list_kb(clients, page=page)
-    text = (
-        "👥 <b>Клиенты и подключения</b>\n"
-        "──────────────────────────────\n"
-        f"Всего подключений: <b>{len(clients)}</b>\n"
-        "Нажмите на клиента для просмотра настроек и получения ссылки:\n"
-    )
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+async def cb_clients_page(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.answer()
+    try:
+        page = int(callback.data.split(":")[-1])
+    except ValueError:
+        page = 0
+    clients = await run(WPPService.get_clients)
+    await show(callback, clients_list_text(len(clients)), clients_list_kb(clients, page=page))
 
 
-@router.callback_query(F.data.startswith("client:view:"))
-async def cb_client_view(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
-    cid = callback.data.split(":")[-1]
-    client = WPPService.get_client_by_id(cid)
+async def render_client(callback: CallbackQuery, cid: str) -> bool:
+    client = await run(WPPService.get_client_by_id, cid)
     if not client:
-        await callback.answer("Клиент не найден!", show_alert=True)
-        return
+        return False
 
     is_enabled = bool(client.get("enabled", True))
     status_str = "🟢 Активен (Включен)" if is_enabled else "🔴 Отключен"
@@ -67,7 +57,7 @@ async def cb_client_view(callback: CallbackQuery):
     up = format_bytes(client.get("traffic_up", 0))
     down = format_bytes(client.get("traffic_down", 0))
     total = client.get("traffic_human", "0 Б")
-    proto = str(client.get("protocol", "vless")).upper()
+    proto = html.escape(str(client.get("protocol", "vless")).upper())
     name = html.escape(str(client.get("name", "Без имени")))
 
     text = (
@@ -76,52 +66,50 @@ async def cb_client_view(callback: CallbackQuery):
         f"🔑 <b>Протокол:</b> <code>{proto}</code>\n"
         f"⚡️ <b>Статус:</b> {status_str}\n"
         f"📊 <b>Трафик:</b> {total} (↑ {up} / ↓ {down})\n"
-        f"🆔 <b>ID:</b> <code>{client.get('id')}</code>\n"
+        f"🆔 <b>ID:</b> <code>{html.escape(str(client.get('id')))}</code>\n"
         f"📅 <b>Создан:</b> {created_date}\n"
         "──────────────────────────────"
     )
-    kb = client_detail_kb(cid, is_enabled)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
+    await show(callback, text, client_detail_kb(cid, is_enabled))
+    return True
+
+
+@router.callback_query(F.data.startswith("client:view:"))
+async def cb_client_view(callback: CallbackQuery, state: FSMContext):
+    # "Отмена" from rename comes here: without clearing, the next text message would rename the client
+    await state.clear()
+    cid = callback.data.split(":")[-1]
+    if await render_client(callback, cid):
+        await callback.answer()
+    else:
+        await callback.answer("Клиент не найден!", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("client:toggle:"))
 async def cb_client_toggle(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
     _, _, cid, action = callback.data.split(":")
     enable = (action == "enable")
     try:
-        WPPService.toggle_client(cid, enable)
-        await callback.answer("Статус клиента изменен ✅")
+        await run(WPPService.toggle_client, cid, enable)
     except Exception as exc:
-        await callback.answer(f"Ошибка: {exc}", show_alert=True)
+        await callback.answer(f"Ошибка: {exc}"[:200], show_alert=True)
         return
 
-    callback.data = f"client:view:{cid}"
-    await cb_client_view(callback)
+    await callback.answer("Статус клиента изменен ✅")
+    await render_client(callback, cid)
 
 
 @router.callback_query(F.data.startswith("client:link:"))
 async def cb_client_link(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
     await callback.answer("Получаем ссылку...")
     cid = callback.data.split(":")[-1]
-    client = WPPService.get_client_by_id(cid)
+    client = await run(WPPService.get_client_by_id, cid)
     if not client:
         await callback.message.answer("Клиент не найден.")
         return
 
     try:
-        link = WPPService.generate_proxy_link(client)
+        link = await run(WPPService.generate_proxy_link, client)
         proto = str(client.get("protocol", "vless")).lower()
         name = html.escape(str(client.get("name", "Без имени")))
 
@@ -130,7 +118,7 @@ async def cb_client_link(callback: CallbackQuery):
         builder.row(InlineKeyboardButton(text="🔙 Назад к клиенту", callback_data=f"client:view:{cid}"))
 
         if proto in ("awg20", "awg31"):
-            doc = BufferedInputFile(link.encode("utf-8"), filename=f"wpp-{client.get('name')}.conf")
+            doc = BufferedInputFile(link.encode("utf-8"), filename=f"wpp-{cid}.conf")
             await callback.message.answer_document(
                 document=doc,
                 caption=f"🛡 Конфигурационный файл для <b>{name}</b> (AmneziaWG)",
@@ -151,23 +139,19 @@ async def cb_client_link(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("client:qr:"))
 async def cb_client_qr(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
     await callback.answer("Генерируем QR-код...")
     cid = callback.data.split(":")[-1]
-    client = WPPService.get_client_by_id(cid)
+    client = await run(WPPService.get_client_by_id, cid)
     if not client:
         await callback.message.answer("Клиент не найден.")
         return
 
     try:
-        link = WPPService.generate_proxy_link(client)
-        proto = str(client.get("protocol", "vless")).upper()
+        link = await run(WPPService.generate_proxy_link, client)
+        proto = html.escape(str(client.get("protocol", "vless")).upper())
         name = html.escape(str(client.get("name", "Без имени")))
 
-        qr_io = generate_qr_bytes(link)
+        qr_io = await run(generate_qr_bytes, link)
         photo = BufferedInputFile(qr_io.getvalue(), filename="qr.png")
 
         builder = InlineKeyboardBuilder()
@@ -190,12 +174,8 @@ async def cb_client_qr(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("client:del_confirm:"))
 async def cb_client_del_confirm(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
     cid = callback.data.split(":")[-1]
-    client = WPPService.get_client_by_id(cid)
+    client = await run(WPPService.get_client_by_id, cid)
     if not client:
         await callback.answer("Клиент не найден", show_alert=True)
         return
@@ -205,59 +185,43 @@ async def cb_client_del_confirm(callback: CallbackQuery):
         f"⚠️ <b>Вы действительно хотите удалить клиента «{name}»?</b>\n\n"
         "Ключ доступа будет аннулирован, а соединение разорвано."
     )
-    kb = confirm_delete_kb("client", cid)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await show(callback, text, confirm_delete_kb("client", cid))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("del:exec:client:"))
 async def cb_client_del_exec(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
     cid = callback.data.split(":")[-1]
     try:
-        WPPService.delete_client(cid)
-        await callback.answer("Клиент успешно удален 🗑", show_alert=True)
+        await run(WPPService.delete_client, cid)
     except Exception as exc:
-        await callback.answer(f"Ошибка удаления: {exc}", show_alert=True)
+        await callback.answer(f"Ошибка удаления: {exc}"[:200], show_alert=True)
         return
 
-    clients = WPPService.get_clients()
-    kb = clients_list_kb(clients, page=0)
-    text = (
-        "👥 <b>Клиенты и подключения</b>\n"
-        "──────────────────────────────\n"
-        f"Всего подключений: <b>{len(clients)}</b>\n"
-    )
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Клиент успешно удален 🗑", show_alert=True)
+    clients = await run(WPPService.get_clients)
+    await show(callback, clients_list_text(len(clients)), clients_list_kb(clients, page=0))
 
 
 @router.callback_query(F.data.startswith("client:rename:"))
 async def cb_client_rename(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-
     cid = callback.data.split(":")[-1]
-    await state.update_data(client_id=cid)
     await state.set_state(RenameClientState.waiting_for_name)
+    await state.update_data(client_id=cid)
 
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🔙 Отмена", callback_data=f"client:view:{cid}"))
 
-    await callback.message.edit_text(
+    await show(
+        callback,
         "✏️ <b>Введите новое имя для клиента:</b>\n<i>(от 1 до 80 символов)</i>",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML",
+        builder.as_markup(),
     )
     await callback.answer()
 
 
-@router.message(RenameClientState.waiting_for_name)
+@router.message(RenameClientState.waiting_for_name, F.text)
 async def msg_client_rename(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-
     data = await state.get_data()
     cid = data.get("client_id")
     new_name = message.text.strip()
@@ -268,17 +232,21 @@ async def msg_client_rename(message: Message, state: FSMContext):
 
     await state.clear()
     try:
-        WPPService.rename_client(cid, new_name)
+        await run(WPPService.rename_client, cid, new_name)
         await message.answer(f"✅ Клиент успешно переименован в <b>{html.escape(new_name)}</b>!", parse_mode="HTML")
     except Exception as exc:
         await message.answer(f"❌ Не удалось переименовать: {html.escape(str(exc))}")
 
-    client = WPPService.get_client_by_id(cid)
+    client = await run(WPPService.get_client_by_id, cid)
     if client:
         is_enabled = bool(client.get("enabled", True))
-        kb = client_detail_kb(cid, is_enabled)
         await message.answer(
-            f"👤 <b>Клиент:</b> <code>{html.escape(client.get('name'))}</code>\nID: <code>{cid}</code>",
-            reply_markup=kb,
+            f"👤 <b>Клиент:</b> <code>{html.escape(str(client.get('name', '')))}</code>\nID: <code>{html.escape(str(cid))}</code>",
+            reply_markup=client_detail_kb(cid, is_enabled),
             parse_mode="HTML",
         )
+
+
+@router.message(RenameClientState.waiting_for_name)
+async def msg_client_rename_not_text(message: Message):
+    await message.answer("⚠️ Отправьте новое имя текстом.")

@@ -39,6 +39,7 @@
   * Кнопка «Скачать бэкап» — формирует официальный архив `.zip` с настройками, ключами и базой и отправляет документом в Telegram.
 * 🔒 **Безопасность**:
   * Доступ строго по белому списку `ADMIN_IDS` (Telegram ID администратора). Неавторизованные пользователи не имеют доступа к боту.
+  * `ADMIN_IDS` обязателен: если он пустой или некорректный, бот не запустится (а не откроется для всех).
 
 ---
 
@@ -47,7 +48,7 @@
 Подключитесь к вашему VPS по SSH (где уже установлена `web-panel-proxy`) и выполните:
 
 ```bash
-git clone https://github.com/ваш-репозиторий/wpp-telegram-bot.git /opt/wpp-telegram-bot-src # или скопируйте папку
+git clone https://github.com/MikeTheEngeneer/WPP-Telegram-Bot.git /opt/wpp-telegram-bot-src
 cd /opt/wpp-telegram-bot-src
 sudo bash install.sh
 ```
@@ -78,3 +79,15 @@ sudo bash install.sh
   ```bash
   systemctl stop wpp-telegram-bot
   ```
+
+---
+
+## 🔄 Автообновление (опционально)
+
+`autoupdate.sh` обновляет git-копию, из которой вы ставили бота (`/opt/wpp-telegram-bot-src`), и при новом коммите заново запускает `install.sh`. Включить проверку каждые 15 минут:
+
+```bash
+echo '*/15 * * * * root /opt/wpp-telegram-bot-src/autoupdate.sh' | sudo tee /etc/cron.d/wpp-telegram-bot
+```
+
+Лог: `/var/log/wpp-bot-autoupdate.log`. Учтите: автообновление запускает новый код из репозитория от root без вашей проверки.

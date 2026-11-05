@@ -1,25 +1,21 @@
 """Handlers for server connections / routes live monitoring."""
 import html
+
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
-from config import ADMIN_IDS
 from keyboards import connection_detail_kb, connections_list_kb
 from service import WPPService, format_bytes
+
+from .common import run, show
 
 router = Router()
 
 
-def is_admin(user_id: int) -> bool:
-    return not ADMIN_IDS or user_id in ADMIN_IDS
-
-
 @router.callback_query(F.data == "conns:list")
 async def cb_conns_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    conns = WPPService.get_connections()
+    await callback.answer()
+    conns = await run(WPPService.get_connections)
     active_now = [c for c in conns if c.get("is_active_now")]
 
     if active_now:
@@ -41,30 +37,18 @@ async def cb_conns_list(callback: CallbackQuery):
         "<i>Ниже приведены серверные транспорты (VLESS, Hysteria 2, CDN, AmneziaWG). "
         "Значок 🔥 показывает маршрут, по которому устройства качают трафик прямо сейчас:</i>"
     )
-    kb = connections_list_kb(conns)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
+    await show(callback, text, connections_list_kb(conns))
 
 
-@router.callback_query(F.data.startswith("conn:view:"))
-async def cb_conn_view(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    cid = callback.data.split(":")[-1]
-    conn = WPPService.get_connection_by_id(cid)
+async def render_connection(callback: CallbackQuery, cid: str) -> bool:
+    conn = await run(WPPService.get_connection_by_id, cid)
     if not conn:
-        await callback.answer("Подключение не найдено!", show_alert=True)
-        return
+        return False
 
     enabled = conn.get("enabled", True)
     status_str = "🟢 Включено (Активно)" if enabled else "🔴 Выключено (Отключено)"
-    is_active = conn.get("is_active_now", False)
 
-    if is_active:
+    if conn.get("is_active_now", False):
         speed_str = conn.get("speed_str", "")
         speed_part = f" (скорость: ⚡️ <b>{speed_str}</b>)" if speed_str and speed_str != "0 Б/с" else ""
         live_status = f"🔥 <b>АКТИВНО ПРЯМО СЕЙЧАС!</b>{speed_part}"
@@ -94,7 +78,7 @@ async def cb_conn_view(callback: CallbackQuery):
         f"🔘 <b>Состояние:</b> {status_str}\n\n"
         f"🛣 <b>Маршрут:</b> <code>{route_label}</code>\n"
         f"🔑 <b>Протокол:</b> <code>{proto}</code> ({mode})\n"
-        f"🔌 <b>Порт:</b> <code>{conn.get('port')}</code>\n"
+        f"🔌 <b>Порт:</b> <code>{html.escape(str(conn.get('port')))}</code>\n"
         f"🌐 <b>Хост / SNI:</b> <code>{host}</code>\n\n"
         f"📊 <b>Трафик по этому маршруту:</b> {total}\n"
         f"  • Исходящий (↑): <code>{up}</code>\n"
@@ -103,29 +87,30 @@ async def cb_conn_view(callback: CallbackQuery):
         f"  {clients_str}\n"
         "──────────────────────────────"
     )
-    kb = connection_detail_kb(cid, enabled)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer()
+    await show(callback, text, connection_detail_kb(cid, enabled))
+    return True
+
+
+@router.callback_query(F.data.startswith("conn:view:"))
+async def cb_conn_view(callback: CallbackQuery):
+    cid = callback.data.split(":", 2)[-1]
+    if await render_connection(callback, cid):
+        await callback.answer()
+    else:
+        await callback.answer("Подключение не найдено!", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("conn:toggle:"))
 async def cb_conn_toggle(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    _, _, cid, action = callback.data.split(":")
+    _, _, rest = callback.data.split(":", 2)
+    cid, _, action = rest.rpartition(":")
     enable = (action == "enable")
 
     try:
-        WPPService.toggle_connection(cid, enable)
-        await callback.answer("Состояние маршрута переключено ✅")
+        await run(WPPService.toggle_connection, cid, enable)
     except Exception as exc:
-        await callback.answer(f"Ошибка: {exc}", show_alert=True)
+        await callback.answer(f"Ошибка: {exc}"[:200], show_alert=True)
         return
 
-    # Refresh view
-    callback.data = f"conn:view:{cid}"
-    await cb_conn_view(callback)
+    await callback.answer("Состояние маршрута переключено ✅")
+    await render_connection(callback, cid)

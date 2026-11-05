@@ -1,28 +1,24 @@
 """Backup export handler."""
 import datetime
+import html
+
 from aiogram import F, Router
 from aiogram.types import BufferedInputFile, CallbackQuery
 
-from config import ADMIN_IDS
 from keyboards import back_to_menu_kb
 from service import WPPService
+
+from .common import run
 
 router = Router()
 
 
-def is_admin(user_id: int) -> bool:
-    return not ADMIN_IDS or user_id in ADMIN_IDS
-
-
 @router.callback_query(F.data == "menu:backup")
 async def cb_export_backup(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
+    await callback.answer()
     wait_msg = await callback.message.answer("📦 Формируем резервную копию настроек WPP...")
     try:
-        raw_zip = WPPService.export_backup_zip()
+        raw_zip = await run(WPPService.export_backup_zip)
         now_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"wpp-backup-{now_str}.zip"
 
@@ -43,5 +39,4 @@ async def cb_export_backup(callback: CallbackQuery):
             parse_mode="HTML",
         )
     except Exception as exc:
-        await wait_msg.edit_text(f"❌ Не удалось создать резервную копию: {exc}")
-    await callback.answer()
+        await wait_msg.edit_text(f"❌ Не удалось создать резервную копию: {html.escape(str(exc))}")
