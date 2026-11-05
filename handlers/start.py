@@ -1,24 +1,22 @@
 """Start command and main dashboard handlers."""
 import html
-from aiogram import F, Router
-from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
 
-from config import ADMIN_IDS
+from aiogram import F, Router
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+
 from keyboards import back_to_menu_kb, main_menu_kb
 from service import WPPService, format_bytes
+
+from .common import run, show
 
 router = Router()
 
 
-def is_admin(user_id: int) -> bool:
-    if not ADMIN_IDS:
-        return True
-    return user_id in ADMIN_IDS
-
-
-def format_dashboard_text() -> str:
-    domain = WPPService.get_domain()
+def build_dashboard() -> tuple[str, InlineKeyboardMarkup]:
+    """Collect everything once (this is the expensive part) and return text + keyboard."""
+    domain = html.escape(WPPService.get_domain())
     clients = WPPService.get_clients()
     subs = WPPService.get_subscriptions()
     conns = WPPService.get_connections()
@@ -74,68 +72,36 @@ def format_dashboard_text() -> str:
         "──────────────────────────────\n"
         "<i>Выберите раздел для управления:</i>"
     )
-    return text
+    return text, main_menu_kb(len(clients), len(subs), len(conns))
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer(
-            f"⛔️ <b>Доступ запрещен.</b>\n\n"
-            f"Ваш Telegram ID: <code>{message.from_user.id}</code>\n"
-            f"Добавьте его в <code>ADMIN_IDS</code> в файле <code>.env</code> для доступа к боту.",
-            parse_mode="HTML",
-        )
-        return
-
-    clients = WPPService.get_clients()
-    subs = WPPService.get_subscriptions()
-    conns = WPPService.get_connections()
-    kb = main_menu_kb(len(clients), len(subs), len(conns))
-    text = format_dashboard_text()
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    text, kb = await run(build_dashboard)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "menu:main")
-async def cb_menu_main(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен", show_alert=True)
-        return
-
-    clients = WPPService.get_clients()
-    subs = WPPService.get_subscriptions()
-    conns = WPPService.get_connections()
-    kb = main_menu_kb(len(clients), len(subs), len(conns))
-    text = format_dashboard_text()
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+async def cb_menu_main(callback: CallbackQuery, state: FSMContext):
+    # "Отмена" in every wizard leads here, so drop any pending input state
+    await state.clear()
     await callback.answer()
+    text, kb = await run(build_dashboard)
+    await show(callback, text, kb)
 
 
 @router.callback_query(F.data == "menu:refresh")
 async def cb_menu_refresh(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    clients = WPPService.get_clients()
-    subs = WPPService.get_subscriptions()
-    conns = WPPService.get_connections()
-    kb = main_menu_kb(len(clients), len(subs), len(conns))
-    text = format_dashboard_text()
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        pass
+    text, kb = await run(build_dashboard)
+    await show(callback, text, kb)
     await callback.answer("Данные и трафик обновлены 🔄")
 
 
 @router.callback_query(F.data == "menu:server_status")
 async def cb_server_status(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    m = WPPService.get_system_metrics()
+    await callback.answer()
+    m = await run(WPPService.get_system_metrics)
     srv = m["services"]
 
     text = (
@@ -153,5 +119,10 @@ async def cb_server_status(callback: CallbackQuery):
         f"  • OpenFlux: {'🟢 Работает' if srv.get('openflux') else '⚪️ Не активен'}\n"
         "──────────────────────────────"
     )
-    await callback.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="HTML")
+    await show(callback, text, back_to_menu_kb())
+
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    # Page counter button: answer so the client stops showing the loading spinner
     await callback.answer()

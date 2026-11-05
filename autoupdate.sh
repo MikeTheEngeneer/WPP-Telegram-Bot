@@ -1,37 +1,48 @@
 #!/usr/bin/env bash
+# Pulls the git checkout this script lives in (e.g. /opt/wpp-telegram-bot-src) and,
+# when there is a new commit, re-runs install.sh which copies files into /opt/wpp-telegram-bot.
+# Example cron (every 15 minutes):
+#   */15 * * * * root /opt/wpp-telegram-bot-src/autoupdate.sh
 set -Eeuo pipefail
 
-TARGET_DIR="/opt/wpp-telegram-bot"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="/var/log/wpp-bot-autoupdate.log"
+BRANCH="${WPP_BOT_BRANCH:-main}"
 
-if [ ! -d "$TARGET_DIR/.git" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Ошибка: $TARGET_DIR не является git-репозиторием." | tee -a "$LOG_FILE"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+# Never run two updates at once (cron + manual run)
+exec 9>/run/wpp-bot-autoupdate.lock
+flock -n 9 || exit 0
+
+if [ ! -d "$SRC_DIR/.git" ]; then
+    log "Ошибка: $SRC_DIR не является git-репозиторием (склонируйте репозиторий и запускайте autoupdate.sh оттуда)."
     exit 1
 fi
 
-cd "$TARGET_DIR"
+cd "$SRC_DIR"
 
-# Fetch remote updates
-if ! git fetch origin main -q 2>> "$LOG_FILE"; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Ошибка git fetch (проверьте доступ SSH Deploy Key к приватному репозиторию)." >> "$LOG_FILE"
+if ! git fetch origin "$BRANCH" -q 2>> "$LOG_FILE"; then
+    log "Ошибка git fetch (нет сети или доступа к репозиторию)."
     exit 0
 fi
 
-LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "")
-REMOTE=$(git rev-parse origin/main 2>/dev/null || echo "")
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse "origin/$BRANCH")
+[ "$LOCAL" = "$REMOTE" ] && exit 0
 
-if [ -n "$LOCAL" ] && [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🚀 Обнаружено обновление! Накатываем коммит: $REMOTE" | tee -a "$LOG_FILE"
-    
-    # Update files to latest commit (keeping local .env untouched)
-    git reset --hard origin/main >> "$LOG_FILE" 2>&1
-    
-    # Update python dependencies
-    "$TARGET_DIR/venv/bin/pip" install -r "$TARGET_DIR/requirements.txt" -q >> "$LOG_FILE" 2>&1
-    
-    # Restart bot service
-    systemctl restart wpp-telegram-bot
-    
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ Бот успешно обновлен и перезапущен!" | tee -a "$LOG_FILE"
+log "🚀 Обнаружено обновление: $LOCAL -> $REMOTE"
+
+# Fast-forward only: local edits or a rewritten remote history stop the update instead of being silently discarded
+if ! git merge --ff-only "origin/$BRANCH" -q >> "$LOG_FILE" 2>&1; then
+    log "❌ Не удалось обновиться fast-forward (локальные изменения или переписанная история). Обновите вручную."
+    exit 1
 fi
 
+# install.sh is non-interactive when /opt/wpp-telegram-bot/.env already exists
+if bash "$SRC_DIR/install.sh" >> "$LOG_FILE" 2>&1; then
+    log "✅ Бот успешно обновлен и перезапущен!"
+else
+    log "❌ install.sh завершился с ошибкой, подробности выше."
+    exit 1
+fi
